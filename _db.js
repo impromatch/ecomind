@@ -1,72 +1,93 @@
 const { getPool } = require("./_db");
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
 module.exports = async function(req, res) {
-  Object.entries(CORS).forEach(([k,v]) => res.setHeader(k,v));
-  if (req.method === "OPTIONS") return res.status(200).end();
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // Güvenlik: sadece GET ile ve secret key ile çalışsın
+  const { secret } = req.query;
+  if (secret !== process.env.SETUP_SECRET) {
+    return res.status(403).json({ error: "Forbidden. Add ?secret=YOUR_SECRET to URL" });
+  }
 
   const db = getPool();
+  const results = [];
 
   try {
-    // GET - kullanici getir
-    if (req.method === "GET") {
-      const { id } = req.query;
-      if (!id) return res.status(400).json({ error: "id required" });
-      const r = await db.query("SELECT * FROM eco_users WHERE id=$1", [id]);
-      return res.status(200).json(r.rows[0] || null);
-    }
+    // 1. Users tablosu
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS eco_users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        avatar TEXT DEFAULT '🧑‍💻',
+        theme TEXT DEFAULT 'nature',
+        lang TEXT DEFAULT 'en',
+        total_score INTEGER DEFAULT 0,
+        games_played INTEGER DEFAULT 0,
+        best_score INTEGER DEFAULT 0,
+        categories TEXT[] DEFAULT '{}',
+        joined_group BOOLEAN DEFAULT false,
+        used_ai BOOLEAN DEFAULT false,
+        played_tournament BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    results.push("✅ eco_users tablosu hazır");
 
-    // POST - kayit / upsert
-    if (req.method === "POST") {
-      const u = req.body;
-      await db.query(`
-        INSERT INTO eco_users (id,name,email,phone,avatar,theme,lang,total_score,games_played,best_score,categories,joined_group,used_ai,played_tournament)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-        ON CONFLICT (id) DO UPDATE SET
-          name=EXCLUDED.name, avatar=EXCLUDED.avatar, theme=EXCLUDED.theme, lang=EXCLUDED.lang,
-          updated_at=NOW()
-      `, [u.id,u.name,u.email||"",u.phone||"",u.avatar||"🧑‍💻",u.theme||"nature",u.lang||"en",
-          u.totalScore||0,u.gamesPlayed||0,u.bestScore||0,
-          u.categories||[],u.joinedGroup||false,u.usedAI||false,u.playedTournament||false]);
-      const r = await db.query("SELECT * FROM eco_users WHERE id=$1", [u.id]);
-      return res.status(200).json(r.rows[0]);
-    }
+    // 2. Groups tablosu
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS eco_groups (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        code TEXT UNIQUE NOT NULL,
+        creator TEXT NOT NULL,
+        creator_id TEXT NOT NULL,
+        members JSONB DEFAULT '[]',
+        scores JSONB DEFAULT '{}',
+        topic TEXT DEFAULT 'karma',
+        status TEXT DEFAULT 'waiting',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    results.push("✅ eco_groups tablosu hazır");
 
-    // PATCH - skor guncelle
-    if (req.method === "PATCH") {
-      const { id, score, category, usedAI, joinedGroup, playedTournament, theme, lang, avatar, name } = req.body;
-      if (!id) return res.status(400).json({ error: "id required" });
+    // 3. İndeksler
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_users_score ON eco_users(total_score DESC)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_groups_code ON eco_groups(code)`);
+    results.push("✅ İndeksler hazır");
 
-      const sets = ["updated_at=NOW()"];
-      const vals = [id];
-      let i = 2;
+    // 4. Trigger
+    await db.query(`
+      CREATE OR REPLACE FUNCTION update_updated_at()
+      RETURNS TRIGGER AS $$
+      BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+      $$ LANGUAGE plpgsql
+    `);
+    await db.query(`
+      DROP TRIGGER IF EXISTS eco_users_updated_at ON eco_users;
+      CREATE TRIGGER eco_users_updated_at
+        BEFORE UPDATE ON eco_users
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at()
+    `);
+    results.push("✅ Trigger hazır");
 
-      if (score !== undefined) {
-        sets.push(`total_score=total_score+$${i++}`, `games_played=games_played+1`, `best_score=GREATEST(best_score,$${i++})`);
-        vals.push(score, score);
-      }
-      if (category) { sets.push(`categories=array_append(categories,$${i++})`); vals.push(category); }
-      if (usedAI !== undefined) { sets.push(`used_ai=$${i++}`); vals.push(usedAI); }
-      if (joinedGroup !== undefined) { sets.push(`joined_group=$${i++}`); vals.push(joinedGroup); }
-      if (playedTournament !== undefined) { sets.push(`played_tournament=$${i++}`); vals.push(playedTournament); }
-      if (theme) { sets.push(`theme=$${i++}`); vals.push(theme); }
-      if (lang) { sets.push(`lang=$${i++}`); vals.push(lang); }
-      if (avatar) { sets.push(`avatar=$${i++}`); vals.push(avatar); }
-      if (name) { sets.push(`name=$${i++}`); vals.push(name); }
+    // 5. Test
+    const test = await db.query("SELECT COUNT(*) FROM eco_users");
+    results.push(`✅ Test başarılı — eco_users: ${test.rows[0].count} kayıt`);
 
-      await db.query(`UPDATE eco_users SET ${sets.join(",")} WHERE id=$1`, vals);
-      const r = await db.query("SELECT * FROM eco_users WHERE id=$1", [id]);
-      return res.status(200).json(r.rows[0]);
-    }
+    return res.status(200).json({
+      success: true,
+      message: "🎉 Veritabanı kurulumu tamamlandı!",
+      results
+    });
 
-    return res.status(405).json({ error: "Method not allowed" });
   } catch(e) {
-    console.error("user api:", e.message);
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({
+      success: false,
+      error: e.message,
+      results
+    });
   }
 };
